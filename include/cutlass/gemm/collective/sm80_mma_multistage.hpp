@@ -63,7 +63,7 @@ template <
   class SmemCopyAtomB_,
   class TransformB_>
 struct CollectiveMma<
-    MainloopSm80CpAsyncUnpredicated<Stages>,
+    MainloopSm80CpAsyncUnpredicated<Stages>, // 没有用predicated的
     TileShape_,
     ElementA_,
     StrideA_,
@@ -360,7 +360,7 @@ template <
   class TransformB_
 >
 struct CollectiveMma<
-    MainloopSm80CpAsync<Stages>,
+    MainloopSm80CpAsync<Stages>,  // 还有一个没有用predicated: MainloopSm80CpAsyncUnpredicated<Stages>
     TileShape_,
     ElementA_,
     StrideA_,
@@ -407,8 +407,14 @@ struct CollectiveMma<
   static_assert((size<1>(TileShape{}) % size<0>(SmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
   static_assert((size<2>(TileShape{}) % size<1>(SmemLayoutAtomB{})) == 0, "SmemLayoutAtom must evenly divide tile shape.");
 
+
+  // 每个stage,TileA大小，从G->S后，在share_mem上的分布。（以swizzle后的SmemLayoutAtomA为单元）* 每个流水线一个
+  // 如果原始A部分的Tile是（128，32），对应该cudablock本身要复制进share的大小
+  // SmemLayoutAtom(64,8),是swizzle一个小tile后的分布，需要拓展(2,4)次 
+  // 得到总的分布情况是：((_64,_2),(_8,_4),_3)。 其中3对应3个大stage。
+  // 因此A占用的share_mem大小，是TileA（128，32）* n_stage(3)。 B相同，翻倍
   using SmemLayoutA = decltype(tile_to_shape(
-      SmemLayoutAtomA{},
+      SmemLayoutAtomA{},  // 原来一个shareMem上，经过swizzle后的SmemLayoutAtom。以此为单位，拓展整个TileA对应的share_mem
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), Int<DispatchPolicy::Stages>{})));
   using SmemLayoutB = decltype(tile_to_shape(
       SmemLayoutAtomB{},
@@ -476,6 +482,7 @@ struct CollectiveMma<
     static_assert(cute::rank(SmemLayoutB{}) == 3, "Smem layout must be rank 3.");
 
     // Construct shared memory tiles
+    // share_mem上的storage
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     Tensor sA = make_tensor(make_smem_ptr(storage.smem_a.data()), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(storage.smem_b.data()), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
@@ -494,11 +501,13 @@ struct CollectiveMma<
     gB.data() = &gB(0, get<2>(residue_mnk), 0);
 
     // Partition the copying of A and B tiles across the threads
+    // G->S
     GmemTiledCopyA gmem_tiled_copy_A;
     GmemTiledCopyB gmem_tiled_copy_B;
     auto gmem_thr_copy_A = gmem_tiled_copy_A.get_slice(thread_idx);
     auto gmem_thr_copy_B = gmem_tiled_copy_B.get_slice(thread_idx);
 
+    // g 和 s对应的threadslice
     Tensor tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
     Tensor tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
     Tensor tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
@@ -541,13 +550,14 @@ struct CollectiveMma<
 
     // Start async loads for 0th k-tile, where we take care of the k residue
     {
+      // 真正执行G->S (只是发射)
       constexpr int k_pipe = 0;
 
       Tensor tAgAk = tAgA(_,_,_,*k_tile_iter);
       CUTLASS_PRAGMA_UNROLL
       for (int k = 0; k < size<2>(tAsA); ++k) {
         if (get<1>(tAcA(0,0,k)) >= -get<2>(residue_mnk)) {      // blk_k coord < residue_k (gA shifted)
-          copy_if(gmem_tiled_copy_A, tApA(_,k), tAgAk(_,_,k), tAsA(_,_,k,k_pipe));
+          copy_if(gmem_tiled_copy_A, tApA(_,k), tAgAk(_,_,k), tAsA(_,_,k,k_pipe)); // tAgAk-> tAsA  G->S
         }
       }
       Tensor tBgBk = tBgB(_,_,_,*k_tile_iter);
@@ -563,6 +573,7 @@ struct CollectiveMma<
     }
 
     // Start async loads for 1st k-tile onwards, no k-residue handling needed
+    // 真正执行G->S (只是发射)
     CUTLASS_PRAGMA_UNROLL
     for (int k_pipe = 1; k_pipe < DispatchPolicy::Stages-1; ++k_pipe) {
       if (k_tile_count <= 0) {
@@ -577,12 +588,13 @@ struct CollectiveMma<
     }
 
     //
-    // MMA Atom partitioning
+    // MMA Atom partitioning  计算部分
     //
 
     // Tile MMA compute thread partitions and allocate accumulators
     TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(thread_idx);
+    // 计算SA(_,_,0),本线程需要提供的多次mma_atoms的所有数据 （寄存器数据）
     Tensor tCrA  = thr_mma.partition_fragment_A(sA(_,_,0));                    // (MMA,MMA_M,MMA_K)
     Tensor tCrB  = thr_mma.partition_fragment_B(sB(_,_,0));                    // (MMA,MMA_N,MMA_K)
 
@@ -596,9 +608,12 @@ struct CollectiveMma<
     // Copy Atom retiling
     //
 
-    auto smem_tiled_copy_A   = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+    auto smem_tiled_copy_A   = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma); // 直接用tiled_mma拓展
+    // 本线程的S->R任务
     auto smem_thr_copy_A     = smem_tiled_copy_A.get_thread_slice(thread_idx);
+    // 为了复制sA大小的(S-R), 本线程需要复制的数据(share_mem上)
     Tensor tCsA           = smem_thr_copy_A.partition_S(sA);                   // (CPY,CPY_M,CPY_K,PIPE)
+    // 该数据，复制到本线程的寄存器中。（retile已有的寄存器存储）。以供mma_atom计算
     Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);                    // (CPY,CPY_M,CPY_K)
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // CPY_M
     CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));            // CPY_K
@@ -625,17 +640,20 @@ struct CollectiveMma<
     // Size of the register pipeline
     auto K_BLOCK_MAX = size<2>(tCrA);
 
+    // 流水线，等待share好了， S->R
     // PREFETCH register pipeline
     if (K_BLOCK_MAX > 1) {
       // Wait until our first prefetched tile is loaded in
-      cp_async_wait<DispatchPolicy::Stages-2>();
+      cp_async_wait<DispatchPolicy::Stages-2>();             // 同步，等待Tile完全复制到了share_mem上
       __syncthreads();
 
       // Prefetch the first rmem from the first k-tile
-      copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{}));
+      // S->R
+      copy(smem_tiled_copy_A, tCsA_p(_,_,Int<0>{}), tCrA_copy_view(_,_,Int<0>{})); //  S->R  tCsA_p (S)-> tCrA_copy_view(R)
       copy(smem_tiled_copy_B, tCsB_p(_,_,Int<0>{}), tCrB_copy_view(_,_,Int<0>{}));
     }
 
+    // 流水线，等待S->R
     CUTLASS_PRAGMA_NO_UNROLL
     for ( ; k_tile_count > -(DispatchPolicy::Stages-1); --k_tile_count)
     {
@@ -657,7 +675,7 @@ struct CollectiveMma<
 
         // Load A, B shmem->regs for k_block+1
         auto k_block_next = (k_block + Int<1>{}) % K_BLOCK_MAX;  // static
-        copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next));
+        copy(smem_tiled_copy_A, tCsA_p(_,_,k_block_next), tCrA_copy_view(_,_,k_block_next)); // S->R tCsA_p (S)-> tCrA_copy_view(R)
         copy(smem_tiled_copy_B, tCsB_p(_,_,k_block_next), tCrB_copy_view(_,_,k_block_next));
         // Copy gmem to smem before computing gemm on each k-pipe
         if (k_block == 0)
@@ -667,6 +685,7 @@ struct CollectiveMma<
             clear(tApA);
             clear(tBpB);
           }
+          // 发射新的G->S
           copy_if(gmem_tiled_copy_A, tApA, tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,smem_pipe_write));
           copy_if(gmem_tiled_copy_B, tBpB, tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,smem_pipe_write));
           cp_async_fence();
@@ -682,11 +701,14 @@ struct CollectiveMma<
         cute::transform(tCrA(_,_,k_block), TransformA{});
         cute::transform(tCrB(_,_,k_block), TransformB{});
         // Thread-level register gemm for k_block
+        // 最终用本线程，里边的寄存器数据，完成计算（大K轴迭代里，一次小迭代,对应的gemm)
+        // tCrA,tCrB是本线程的寄存器变量
         cute::gemm(tiled_mma, accum, tCrA(_,_,k_block), tCrB(_,_,k_block), src_accum);
       });
 
     }
 
+    // 整个计算结束
     cp_async_wait<0>();
     __syncthreads();
   }

@@ -97,18 +97,30 @@ struct DefaultGemm_TensorOpSm80_OperandA<half_t, layout::RowMajor, 8, 64>
 /// Operand A - Column-major (M-major)
 template <int SizeK>
 struct DefaultGemm_TensorOpSm80_OperandA<half_t, layout::ColumnMajor, 8, SizeK>
-{
+{  // A本身
+
   // Smem
-  using SmemLayoutAtom = decltype(
+  // 列主序(64,8),每列内存连续。解释成逻辑1D矩阵，8个连续元素一组，8组组成逻辑上的一行（即64一列），共8行（原来的8列）
+  // 即((8,8),8). 每列用8个线程处理，swizzle后，读取到8个不同bank(bank_group)中
+
+  // 写入的bank_id  首列    第二列,该逻辑位置，写入的bank_id=irow(1)^icol[0-7]=0，1，3，2，5，4，7，6  第8列
+  //               0       1
+  //               1       0
+  //              ..
+  //               6       7  （读取该8元素的线程，写入bank7）
+  //               7       6  （读取该8元素的线程，写入bank6）   // (64,8列) 每列写入share_mem的8个线程，一个phase,没有bank_conflict
+  using SmemLayoutAtom = decltype(                          // 经过swizzle后的共享内存上的layout
     composition(Swizzle<3,3,3>{},
                 Layout<Shape <_64, _8>,
-                       Stride< _1,_64>>{}));
-  using SmemCopyAtom = Copy_Atom<SM75_U16x8_LDSM_T, half_t>;
+                       Stride< _1,_64>>{})); 
+
+  using SmemCopyAtom = Copy_Atom<SM75_U16x8_LDSM_T, half_t>; // 共享内存到寄存器的拷贝
 
   // Gmem
-  using GmemTiledCopy = decltype(
+  // G->S,用的cp.aysnc,异步拷贝。每个线程复制128bits,复制一列，到share_mem上swizzle后的bank_id
+  using GmemTiledCopy = decltype(   // 全局内存->共享内存
     make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, half_t>{},
-                    Layout<Shape <_16, _8>,
+                    Layout<Shape <_16, _8>,     // 线程按列主序拓展，128个线程？每个线程一条指令，8个线程复制上边一列
                            Stride< _1,_16>>{},
                     Layout<Shape < _8, _1>>{}));
 };
@@ -162,21 +174,46 @@ struct DefaultGemmConfigurationToCutlass3Types<
     half_t, LayoutB,
     float, LayoutC,
     float>
-{
+{ // sm80 gemm f16_f16_f32 用的这个
+  // tile大小：(128,128,32),可以划分为（4，4，2）个tilemma。是每个cudablock处理的大小
   using TileShape = Shape<_128, _128, _32>;
+  // 线程数：128个
   static constexpr int ThreadCount = 128;
   using DispatchPolicy = MainloopSm80CpAsync<3>;
   using TiledMma = TiledMMA<
-      MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
+      // 原来是16,8,16
+      MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>, // A是T,行主序
+      // 拓展成32，16，16 （MN维拓展线程）
       Layout<Shape<_2,_2,_1>>,  // 2x2x1 thread group
+      // 相当于N方向再拓展2维: Layout<Shape<_1,_2,_1>>>; 32,16,16
+      // 因此该tilemma，是32，32，16，含8个MMA_ATom（2,2*2,1）
       Tile<_32,_32,_16>>;       // 32x32x16 MMA for LDSM, 1x2x1 value group
 
   // A
+  // 定义A用到的copy layout:shared memory layout
   static constexpr int kAlignmentA = 8;
   using DefaultOperandA = detail::DefaultGemm_TensorOpSm80_OperandA<
     half_t, LayoutA, kAlignmentA, 32>;
-  using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K
+  // 经过swizzle后的共享内存上的layout（64，8）
+  using SmemLayoutAtomA = typename DefaultOperandA::SmemLayoutAtom; // M, K    // 经过swizzle后的共享内存上的layout
+
+  //共享内存到寄存器的拷贝,使用的copyAtom
+  //using SmemCopyAtom = Copy_Atom<SM75_U16x8_LDSM_T, half_t>; // 共享内存到寄存器的拷贝
   using SmemCopyAtomA = typename DefaultOperandA::SmemCopyAtom;
+
+  // Gmem,全局内存->共享内存
+  // 128个线程，可以处理128 * 8个数据。 
+  // (16,8)排列，每列16个线程可以读取128个元素，8列，可以读取(128,8)的元素，G->S
+  //    本cuda要处理的tileA大小是（OperandA 128 x 32），需要执行4次，复制完该tile. 每个线程执行4次该指令
+  // using GmemTiledCopy = decltype(   // 全局内存->共享内存
+  //   make_tiled_copy(
+  //                   // 每个线程用cp_async作为atom指令,方向按value_layout,读取8个half_t元素
+  //                   Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, half_t>{}, 
+  //                   总共128个线程，按(16,8)列主序排列。每列16个线程，共8列
+  //                   Layout<Shape <_16, _8>,
+  //                          Stride< _1,_16>>{},  // 128线程。线程id(16,8)列主序排列，可以处理128*8个元素
+  //                   每个线程读取时，沿着列，读取连续的8个元素=128bit. 对应一条cp.sync128指令
+  //                   Layout<Shape < _8, _1>>{}));// value维度的拓展，每个线程，沿着列读连续8个元素
   using GmemTiledCopyA = typename DefaultOperandA::GmemTiledCopy;
 
   // B
@@ -188,12 +225,15 @@ struct DefaultGemmConfigurationToCutlass3Types<
   using GmemTiledCopyB = typename DefaultOperandB::GmemTiledCopy;
 
   // Mainloop
+  // 包含SmemLayoutA{})：
+  //  根据tileA(128,32),划分A的share_mem swiizle后的分布 ：((_64,_2),(_8,_4),_3):((_1,_512),(_64,_1024),_4096)
+  // （include/cutlass/gemm/collective/sm80_mma_multistage.hpp里的CollectiveMma）
   using CollectiveMainloop = collective::CollectiveMma<
     DispatchPolicy, TileShape,
     half_t, TagToStrideA_t<LayoutA>,
     half_t, TagToStrideB_t<LayoutB>,
     TiledMma,
-    GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,  // A
+    GmemTiledCopyA, SmemLayoutAtomA, SmemCopyAtomA, cute::identity,  // A  SmemLayoutAtomA-> SmemLayoutA
     GmemTiledCopyB, SmemLayoutAtomB, SmemCopyAtomB, cute::identity   // B
   >;
 

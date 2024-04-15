@@ -58,7 +58,7 @@ template <
   class ThreadEpilogueOp_,
   class EpilogueSchedule_
 >
-class DefaultEpilogue {
+class DefaultEpilogue {  // 80用这个？
 public:
   //
   // Type Aliases
@@ -166,6 +166,7 @@ public:
       int thread_idx,
       [[maybe_unused]] char* smem_buf)
   {
+    // 核心函数
     using namespace cute;
     using X = Underscore;
 

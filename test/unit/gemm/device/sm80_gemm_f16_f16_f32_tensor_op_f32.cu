@@ -53,7 +53,7 @@ using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 #if 1
-TEST(SM80_Device_Gemm_f16t_f16n_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) {
+TEST(SM80_Device_Gemm_f16t_f16n_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) {// tnt
   using Config = cutlass::gemm::device::DefaultGemmConfigurationToCutlass3Types<
     cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
     cutlass::half_t, cutlass::layout::RowMajor,
@@ -63,8 +63,8 @@ TEST(SM80_Device_Gemm_f16t_f16n_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) {
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       Shape<int,int,int,int>,
-      Config::CollectiveMainloop,
-      Config::CollectiveEpilogue
+      Config::CollectiveMainloop, // main循环
+      Config::CollectiveEpilogue  // 写出？80没有，可能是"default_epilogue.hpp"？
   >;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
@@ -73,7 +73,7 @@ TEST(SM80_Device_Gemm_f16t_f16n_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) {
 #endif
 /////////////////////////////////////////////////////////////////////////////////////////////////
 #if 1
-TEST(SM80_Device_Gemm_f16n_f16t_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) {
+TEST(SM80_Device_Gemm_f16n_f16t_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) { //ntt
   using Config = cutlass::gemm::device::DefaultGemmConfigurationToCutlass3Types<
     cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
     cutlass::half_t, cutlass::layout::ColumnMajor,
@@ -93,7 +93,7 @@ TEST(SM80_Device_Gemm_f16n_f16t_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-TEST(SM80_Device_Gemm_f16n_f16n_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) {
+TEST(SM80_Device_Gemm_f16n_f16n_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) { //nnt
   using Config = cutlass::gemm::device::DefaultGemmConfigurationToCutlass3Types<
     cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
     cutlass::half_t, cutlass::layout::ColumnMajor,
@@ -113,7 +113,7 @@ TEST(SM80_Device_Gemm_f16n_f16n_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-TEST(SM80_Device_Gemm_f16t_f16t_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) {
+TEST(SM80_Device_Gemm_f16t_f16t_f32t_tensor_op_f32_3x, 128x128x32_64x64x32) { // ttt
   using Config = cutlass::gemm::device::DefaultGemmConfigurationToCutlass3Types<
     cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
     cutlass::half_t, cutlass::layout::RowMajor,

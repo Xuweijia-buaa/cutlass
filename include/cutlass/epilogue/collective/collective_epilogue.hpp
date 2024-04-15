@@ -53,7 +53,7 @@ class CollectiveEpilogue {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "detail.hpp"
-#include "default_epilogue.hpp"
+#include "default_epilogue.hpp"  // 没有80专门的
 #include "default_epilogue_array.hpp"
 #include "epilogue_tensor_broadcast.hpp"
 #include "sm70_epilogue_vectorized.hpp"
